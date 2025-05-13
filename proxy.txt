@@ -1,0 +1,127 @@
+const fs = require('fs');
+const os = require('os');
+const axios = require('axios');
+const chalk = require('chalk');
+const { execSync } = require('child_process');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const THREAD_COUNT = 10;
+let goodProxies = [];
+let lastUpdateTime = '';
+
+function getFormattedTime() {
+    const now = new Date();
+    const time = now.toLocaleTimeString('vi-VN', { hour12: false });
+    const date = now.toLocaleDateString('vi-VN');
+    return `${time} ${date}`;
+}
+
+async function checkProxy(proxy, threadId) {
+    console.log(chalk.blue(`[THREAD ${threadId}] Checking: ${proxy}`));
+    const controller = new AbortController();
+    const startTime = Date.now();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+        const res = await axios.get('https://api.myip.com', {
+            httpsAgent: new HttpsProxyAgent('http://' + proxy),
+            timeout: 2000,
+            signal: controller.signal
+        });
+        const responseTime = Date.now() - startTime;
+        if (res.data && res.data.country && responseTime >= 1000 && responseTime <= 2000) {
+            console.log(chalk.green(`[LIVE] ${proxy} - ${res.data.country} (${responseTime}ms)`));
+            goodProxies.push({ proxy, country: res.data.country, time: responseTime });
+        } else {
+            console.log(chalk.yellow(`[SKIP] ${proxy} (${responseTime}ms)`));
+        }
+    } catch {
+        console.log(chalk.red(`[DEAD] ${proxy}`));
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function checkProxies(proxies) {
+    goodProxies = [];
+    const threads = Array.from({ length: THREAD_COUNT }, () => []);
+    proxies.forEach((proxy, i) => threads[i % THREAD_COUNT].push(proxy));
+
+    await Promise.all(
+        threads.map((group, index) =>
+            (async () => {
+                for (const proxy of group) {
+                    await checkProxy(proxy, index + 1);
+                }
+            })()
+        )
+    );
+
+    const fileName = 'http.txt';
+    fs.writeFileSync(fileName, goodProxies.map(p => p.proxy).join('\n'));
+    lastUpdateTime = getFormattedTime();
+}
+
+async function performScan() {
+    try {
+        execSync('node scrape.js', { stdio: 'inherit' });
+    } catch (e) {
+        console.error('❌ Lỗi khi chạy scrape.js:', e.message);
+        return;
+    }
+
+    const proxies = fs.readFileSync('proxy.txt', 'utf-8').split('\n').filter(Boolean);
+    if (!proxies.length) {
+        console.log('⚠️ Không có proxy để kiểm tra.');
+        return;
+    }
+
+    console.log(`🔍 Đang lọc ${proxies.length} proxy...`);
+    await checkProxies(proxies);
+    console.log(`✅ Đã lọc xong: ${goodProxies.length} proxy tốt.`);
+}
+
+// === ROUTES ===
+app.get('/', (req, res) => {
+    const proxyCount = goodProxies.length;
+    const html = `
+    <html>
+    <head><title>API Proxy</title></head>
+    <body>
+        <h1>API Proxy HTTP Telegram: @Daukute</h1>
+        <p>API endpoints:</p>
+        <ul>
+          <li><a href="/proxy">/proxy</a> - Xem tất cả các HTTP(s) proxy</li>
+          <li><a href="/update">/update</a> - Cập nhật danh sách proxy</li>
+        </ul>
+        <p>Download proxy files:</p>
+        <ul>
+          <li><a href="/http.txt">/http.txt</a> - Tất Tất cả HTTP(s) proxies (.txt) - <strong>${proxyCount} proxy</strong></li>
+        </ul>
+        <p>Lần cập nhật cuối: ${lastUpdateTime || 'Chưa cập nhật'}</p>
+    </body>
+    </html>
+    `;
+    res.send(html);
+});
+
+app.get('/proxy', (req, res) => {
+    res.json(goodProxies.map(p => p.proxy));
+});
+
+app.get('/http.txt', (req, res) => {
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(goodProxies.map(p => p.proxy).join('\n'));
+});
+
+app.get('/update', async (req, res) => {
+    res.send('🔄 Đang cập nhật proxy, vui lòng chờ...');
+    await performScan();
+});
+
+// === START SERVER ===
+app.listen(PORT, () => {
+    console.log(chalk.cyan(`[✓] Server đang chạy tại http://localhost:${PORT}`));
+});
